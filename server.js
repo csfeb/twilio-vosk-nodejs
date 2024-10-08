@@ -33,7 +33,10 @@ wss.on('connection', (ws, req) => {
 function transcribeAudioStream(data) {
   try {
     const json = JSON.parse(data);
-    return json.sequenceNumber;
+    return {
+      seq: json.sequenceNumber,
+      event: json.event
+    };
   } catch (e) {
     console.log('Not JSON message: %s', data);
     return null;
@@ -43,7 +46,7 @@ function transcribeAudioStream(data) {
 function broadcastMessage(message, keyToIgnore) {
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN && client.id != keyToIgnore) {
-      client.send(message);
+      client.send(JSON.stringify(message));
     }
   });
 }
