@@ -58,11 +58,9 @@ function transcribeAudioStream(data, rec) {
       wav.toSampleRate(16000);
       if (rec.acceptWaveform(wav.data.samples)) {
         const result = rec.result();
-        console.log(result);
         return result.text;
       } else {
         const result = rec.partialResult();
-        console.log(result);
         return result.partial;
       }
     }
