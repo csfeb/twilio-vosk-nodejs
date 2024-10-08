@@ -34,10 +34,12 @@ wss.on('connection', (ws, req) => {
   });
 
   const rec = new Recognizer({ model: voskModel, sampleRate: 16000 })
+  var lastBroadcast;
 
   ws.on('message', (data) => {
     const result = transcribeAudioStream(data, rec);
-    if (result) {
+    if (result && result != lastBroadcast) {
+      lastBroadcast = result;
       broadcastMessage(result, key);
     }
   });
@@ -51,12 +53,8 @@ function transcribeAudioStream(data, rec) {
     } else if (json.event == 'stop') {
       console.log('Audio stream stopped');
     } else if (json.event == 'media') {
-      const buf = Buffer.from(json.media.payload, 'base64');
-      const wav = new WaveFile();
-      wav.fromScratch(1, 8000, '8m', buf);
-      wav.fromMuLaw();
-      wav.toSampleRate(16000);
-      if (rec.acceptWaveform(wav.data.samples)) {
+      const samples = getSamples(json.media.payload);
+      if (rec.acceptWaveform(samples)) {
         const result = rec.result();
         return result.text;
       } else {
@@ -68,6 +66,15 @@ function transcribeAudioStream(data, rec) {
     console.log('Not JSON message: %s', data);
   }
   return null;
+}
+
+function getSamples(payload) {
+  const buf = Buffer.from(payload, 'base64');
+  const wav = new WaveFile();
+  wav.fromScratch(1, 8000, '8m', buf);
+  wav.fromMuLaw();
+  wav.toSampleRate(16000);
+  return wav.data.samples;
 }
 
 function broadcastMessage(message, keyToIgnore) {
