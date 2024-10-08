@@ -6,7 +6,7 @@ const wss = new WebSocketServer({
   clientTracking: true
 });
 
-wss.on('connection', function connection(ws, req) {
+wss.on('connection', (ws, req) => {
   const key = req.headers['sec-websocket-key'];
   if (!key) {
     console.log('Missing socket key');
@@ -22,16 +22,30 @@ wss.on('connection', function connection(ws, req) {
     console.log('Client %s disconnected.', key);
   });
 
-  ws.on('message', (data, isBinary) => {
-    console.log('Got message from %s, contents: %s %d', key, data, isBinary);
-
-    // Broadcast
-    // wss.clients.forEach((client) => {
-    //   if (client.readyState === WebSocket.OPEN && client.id != key) {
-    //     client.send(data, { binary: isBinary });
-    //   }
-    // });
+  ws.on('message', (data) => {
+    const result = transcribeAudioStream(data);
+    if (result) {
+      broadcastMessage(result, key);
+    }
   });
 });
+
+function transcribeAudioStream(data) {
+  try {
+    const json = JSON.parse(data);
+    return json.sequenceNumber;
+  } catch (e) {
+    console.log('Not JSON message: %s', data);
+    return null;
+  }
+}
+
+function broadcastMessage(message, keyToIgnore) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN && client.id != keyToIgnore) {
+      client.send(message);
+    }
+  });
+}
 
 console.log("Started on port", port);
