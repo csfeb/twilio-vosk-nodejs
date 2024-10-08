@@ -1,6 +1,7 @@
 {
   "type": "module",
   "dependencies": {
+    "vosk": "^0.3.39",
     "ws": "^8.18.0",
     "wscat": "^6.0.1"
   }
