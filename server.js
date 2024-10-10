@@ -43,6 +43,7 @@ wss.on('connection', (ws, req) => {
     console.log('Missing socket key');
     ws.terminate();
   }
+  ws.id = key;
 
   console.log('Client %s connected.', key);
 
@@ -56,33 +57,59 @@ wss.on('connection', (ws, req) => {
   var lastBroadcast;
 
   ws.on('message', (data) => {
-    const result = transcribeAudioStream(data, rec);
-    if (result && result != lastBroadcast) {
-      lastBroadcast = result;
-      broadcastMessage(result, key);
+    try {
+      const json = JSON.parse(data);
+      if (json.action) {
+        handleAction(json, ws, key);
+      } else if (json.streamSid) {
+        // Twilio audio stream message
+        const result = transcribeAudioStream(json, rec);
+        if (result && result != lastBroadcast) {
+          lastBroadcast = result;
+          broadcastMessage(result, key);
+        }
+      } else {
+        console.log('Unexpected JSON payload');
+      }
+    } catch (e) {
+      console.log('Not JSON message: %s', data);
     }
   });
 });
 
-function transcribeAudioStream(data, rec) {
-  try {
-    const json = JSON.parse(data);
-    if (json.event == 'start') {
-      console.log('Audio stream starting');
-    } else if (json.event == 'stop') {
-      console.log('Audio stream stopped');
-    } else if (json.event == 'media') {
-      const samples = getSamples(json.media.payload);
-      if (rec.acceptWaveform(samples)) {
-        const result = rec.result();
-        return result.text;
-      } else {
-        const result = rec.partialResult();
-        return result.partial;
-      }
+function handleAction(json, ws, keyToIgnore) {
+  switch (json.action) {
+  case 'ping':
+    ws.send(new Date().toISOString());
+    break;
+
+  case 'broadcast':
+    if (json.msg) {
+      broadcastMessage(json.msg, keyToIgnore);
+    } else {
+      console.log('msg field missing for broadcast');
     }
-  } catch (e) {
-    console.log('Not JSON message: %s', data);
+    break;
+
+  default:
+    console.log('Unknown action ${json.action}');
+  }
+}
+
+function transcribeAudioStream(json, rec) {
+  if (json.event == 'start') {
+    console.log('Audio stream starting');
+  } else if (json.event == 'stop') {
+    console.log('Audio stream stopped');
+  } else if (json.event == 'media') {
+    const samples = getSamples(json.media.payload);
+    if (rec.acceptWaveform(samples)) {
+      const result = rec.result();
+      return result.text;
+    } else {
+      const result = rec.partialResult();
+      return result.partial;
+    }
   }
   return null;
 }
