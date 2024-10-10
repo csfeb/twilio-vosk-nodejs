@@ -1,6 +1,7 @@
 {
   "type": "module",
   "dependencies": {
+    "express": "^4.21.1",
     "vosk": "^0.3.39",
     "wavefile": "^11.0.0",
     "ws": "^8.18.0",

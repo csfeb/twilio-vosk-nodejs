@@ -1,9 +1,24 @@
+// Audio stream processing
 import { Buffer } from 'buffer';
 import { existsSync as filePathExists } from 'fs';
 import { Model as VoskModel, Recognizer } from 'vosk';
 import wavefilepkg from 'wavefile';
 const { WaveFile } = wavefilepkg;
+
+// Server
+import express from 'express';
+import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+
+const port = process.env.PORT || 8080;
+
+const app = express();
+
+app.use('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+const server = http.createServer(app);
 
 const modelPath = 'model';
 if (!filePathExists(modelPath)) {
@@ -11,10 +26,15 @@ if (!filePathExists(modelPath)) {
 }
 const voskModel = new VoskModel(modelPath);
 
-const port = process.env.PORT || 8080;
 const wss = new WebSocketServer({
-  port: 8080,
-  clientTracking: true
+  clientTracking: true,
+  noServer: true
+});
+
+server.on('upgrade', (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
 });
 
 wss.on('connection', (ws, req) => {
@@ -23,7 +43,6 @@ wss.on('connection', (ws, req) => {
     console.log('Missing socket key');
     ws.terminate();
   }
-  ws.id = key;
 
   console.log('Client %s connected.', key);
 
@@ -85,4 +104,6 @@ function broadcastMessage(message, keyToIgnore) {
   });
 }
 
-console.log("Started on port", port);
+server.listen(port, () => {
+  console.log("Listening on port", port);
+});
