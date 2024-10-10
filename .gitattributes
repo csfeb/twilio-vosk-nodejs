@@ -4,3 +4,4 @@ model/graph/HCLr.fst filter=lfs diff=lfs merge=lfs -text
 model/ivector/final.dubm filter=lfs diff=lfs merge=lfs -text
 model/ivector/final.ie filter=lfs diff=lfs merge=lfs -text
 model/ivector/final.mat filter=lfs diff=lfs merge=lfs -text
+vosk-linux-aarch64-0.3.38/libvosk.so filter=lfs diff=lfs merge=lfs -text
