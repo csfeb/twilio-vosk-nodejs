@@ -10,11 +10,17 @@ import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 3000;
 
 const app = express();
 
-app.use('/health', (req, res) => {
+app.get('/', (req, res) => {
+  res.writeHead(200, {'Content-Type': 'text/html'});
+  const html = '<html><body><h1>Twilio + vosk + nodejs prototype server</h1></body></html>';
+  res.end(html);
+});
+
+app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
