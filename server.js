@@ -5,14 +5,25 @@ import { Model as VoskModel, Recognizer } from 'vosk';
 import wavefilepkg from 'wavefile';
 const { WaveFile } = wavefilepkg;
 
+// AWS
+import { 
+  ApiGatewayManagementApiClient, 
+  PostToConnectionCommand, 
+  DeleteConnectionCommand,
+} from "@aws-sdk/client-apigatewaymanagementapi";
+
 // Server
+import bodyParser from 'body-parser';
 import express from 'express';
 import http from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
 
 const port = process.env.PORT || 3000;
+if (!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI) {
+  console.error('Container credentials missing');
+}
 
 const app = express();
+app.use(bodyParser.json());
 
 app.get('/', (req, res) => {
   res.writeHead(200, {'Content-Type': 'text/html'});
@@ -25,116 +36,207 @@ app.get('/health', (req, res) => {
 });
 
 const server = http.createServer(app);
+const connections = new Set();
 
 const modelPath = 'model';
 if (!filePathExists(modelPath)) {
   throw Error('Vosk model cannot be found.');
 }
-const voskModel = new VoskModel(modelPath);
 
-const wss = new WebSocketServer({
-  clientTracking: true,
-  noServer: true
-});
+// Audio stream
+const voskSampleRate = 16000;
+var voskModel;
+var voskRecognizer;
+var inboundStreamMediaFormat = {};
+var lastTranscribeBroadcast;
 
-server.on('upgrade', (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
-  });
-});
+// Routes
 
-wss.on('connection', (ws, req) => {
-  const key = req.headers['sec-websocket-key'];
-  if (!key) {
-    console.log('Missing socket key');
-    ws.terminate();
+app.post('/connect', (req, res) => {
+  const connectionId = req.body.connectionId;
+  if (!connectionId) {
+    return res.status(400).send('connectionId missing');
   }
-  ws.id = key;
-
-  console.log('Client %s connected.', key);
-
-  ws.on('error', console.error);
-
-  ws.on('close', () => {
-    console.log('Client %s disconnected.', key);
-  });
-
-  const rec = new Recognizer({ model: voskModel, sampleRate: 16000 })
-  var lastBroadcast;
-
-  ws.on('message', (data) => {
-    try {
-      const json = JSON.parse(data);
-      if (json.action) {
-        handleAction(json, ws, key);
-      } else if (json.streamSid) {
-        // Twilio audio stream message
-        const result = transcribeAudioStream(json, rec);
-        if (result && result != lastBroadcast) {
-          lastBroadcast = result;
-          broadcastMessage(result, key);
-        }
-      } else {
-        console.log('Unexpected JSON payload');
-      }
-    } catch (e) {
-      console.log('Not JSON message: %s', data);
-    }
-  });
+  connections.add(connectionId);
+  console.debug(`Client ${connectionId} connected`);
+  res.sendStatus(200);
 });
 
-function handleAction(json, ws, keyToIgnore) {
-  switch (json.action) {
-  case 'ping':
-    ws.send(new Date().toISOString());
-    break;
+app.post('/disconnect', (req, res) => {
+  const connectionId = req.body.connectionId;
+  if (connectionId) {
+    connections.delete(connectionId);
+    console.debug(`Client ${connectionId} disconnected`);
+  } else {
+    console.error('Client without a connectionId disconnected');
+  }
+  res.sendStatus(200);
+});
 
-  case 'broadcast':
-    if (json.msg) {
-      broadcastMessage(json.msg, keyToIgnore);
-    } else {
-      console.log('msg field missing for broadcast');
-    }
-    break;
+// Send a message to all other clients
+app.put('/send', async (req, res) => {
+  if (!req.body.payload || !req.body.payload.msg) {
+    console.error('/send msg missing');
+    return res.status(400).send('msg missing');;
+  }
 
-  default:
-    console.log('Unknown action ${json.action}');
+  console.debug(`Active connection count: ${connections.size}`);
+  await broadcastMessage(req, req.body.payload.msg);
+  res.sendStatus(200);
+});
+
+app.put('/default', async (req, res) => {
+  const connectionId = req.body.connectionId;
+  if (!connectionId) {
+    console.error('/default connectionId missing');
+    return res.status(400).send('connectionId missing');
+  }
+
+  if (!req.body.payload) {
+    console.error('/default payload missing');
+    return res.status(400).send('payload missing');
+  }
+
+  const payload = req.body.payload;
+  if (payload.event == 'connected' && payload.protocol == 'Call') {
+    streamConnected();
+  } else if (payload.event == 'start') {
+    await streamStart(req);
+  } else if (payload.event == 'media') {
+    await streamMedia(req);
+  } else if (payload.event == 'stop') {
+    streamStop(req);
+  } else {
+    console.debug(`Unknown payload sent to $default route: ${JSON.stringify(payload)}`);
+  }
+
+  res.sendStatus(200);
+});
+
+// Socket communication helpers
+
+function makeApiClient(req) {
+  if (!req.body.domainName) {
+    console.error('domainName missing');
+    return null;
+  }
+
+  if (!req.body.stage) {
+    console.error('stage missing');
+    return null;
+  }
+
+  const callbackUrl = `https://${req.body.domainName}/${req.body.stage}`;
+  const client = new ApiGatewayManagementApiClient({ endpoint: callbackUrl });
+  return client;
+}
+
+async function killWebSocketConnection(req) {
+  const apiClient = makeApiClient(req);
+  const connectionId = req.body.connectionId;
+  const command = new DeleteConnectionCommand({
+    ConnectionId: connectionId
+  });
+  try {
+    await apiClient.send(command);
+  } catch (error) {
+    console.error(`Failed to kill connection ${connectionId}, error: ${error}`);
   }
 }
 
-function transcribeAudioStream(json, rec) {
-  if (json.event == 'start') {
-    console.log('Audio stream starting');
-  } else if (json.event == 'stop') {
-    console.log('Audio stream stopped');
-  } else if (json.event == 'media') {
-    const samples = getSamples(json.media.payload);
-    if (rec.acceptWaveform(samples)) {
-      const result = rec.result();
-      return result.text;
-    } else {
-      const result = rec.partialResult();
-      return result.partial;
+async function broadcastMessage(req, msg) {
+  const apiClient = makeApiClient(req);
+  const myConnectionId = req.body.connectionId;
+
+  for (const connectionId of connections) {
+    if (connectionId != myConnectionId) {
+      const command = new PostToConnectionCommand({
+        ConnectionId: connectionId,
+        Data: msg
+      });
+      try {
+        await apiClient.send(command);
+      } catch (error) {
+        console.error(`Failed to broadcast message with error: ${error}`);
+      }
     }
   }
-  return null;
+}
+
+// Audio stream helpers
+
+function streamConnected() {
+  console.debug('Call connected, initializing Vosk model...');
+  voskModel = new VoskModel(modelPath);
+  voskRecognizer = new Recognizer({ model: voskModel, sampleRate: voskSampleRate })
+}
+
+async function streamStart(req) {
+  const payload = req.body.payload;
+  console.debug(`Starting stream with ID: ${payload.streamSid}`);
+  inboundStreamMediaFormat = parseInboundStreamMediaFormat(payload);
+  if (!parseInboundStreamMediaFormat) {
+    await killWebSocketConnection(req);
+  }
+}
+
+async function streamMedia(req) {
+  const payload = req.body.payload;
+  const result = getTranscription(payload.media.payload);
+  if (result && result != lastTranscribeBroadcast) {
+    lastTranscribeBroadcast = result;
+    await broadcastMessage(req, result);
+  }
+}
+
+function streamStop(req) {
+  const payload = req.body.payload;
+  console.debug(`Stopping stream with ID: ${payload.streamSid}`);
+  voskRecognizer = null;
+  voskModel = null;
+}
+
+function parseInboundStreamMediaFormat(payload) {
+  if (!payload.start.mediaFormat) {
+    console.error('Missing mediaFormat');
+    return null;
+  }
+
+  if (payload.start.mediaFormat.encoding != 'audio/x-mulaw') {
+    console.error(`Unexpected media encoding: ${payload.start.mediaFormat.encoding}`);
+    return null;
+  }
+
+  return {
+    channels: payload.start.mediaFormat.channels,
+    sampleRate: payload.start.mediaFormat.sampleRate,
+    bitDepth: '8m'
+  };
 }
 
 function getSamples(payload) {
   const buf = Buffer.from(payload, 'base64');
   const wav = new WaveFile();
-  wav.fromScratch(1, 8000, '8m', buf);
+  wav.fromScratch(
+    inboundStreamMediaFormat.channels,
+    inboundStreamMediaFormat.sampleRate,
+    inboundStreamMediaFormat.bitDepth,
+    buf
+  );
   wav.fromMuLaw();
-  wav.toSampleRate(16000);
+  wav.toSampleRate(voskSampleRate);
   return wav.data.samples;
 }
 
-function broadcastMessage(message, keyToIgnore) {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN && client.id != keyToIgnore) {
-      client.send(JSON.stringify(message));
-    }
-  });
+function getTranscription(mediaPayload) {
+  const samples = getSamples(mediaPayload);
+  if (voskRecognizer.acceptWaveform(samples)) {
+    const result = voskRecognizer.result();
+    return result.text;
+  } else {
+    const result = voskRecognizer.partialResult();
+    return result.partial;
+  }
 }
 
 server.listen(port, () => {
