@@ -18,9 +18,7 @@ import express from 'express';
 import http from 'http';
 
 const port = process.env.PORT || 3000;
-if (!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI) {
-  console.error('Container credentials missing');
-}
+const isLocal = !process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI;
 
 const app = express();
 app.use(bodyParser.json());
@@ -47,6 +45,7 @@ if (!filePathExists(modelPath)) {
 const voskSampleRate = 16000;
 let voskModel;
 let voskRecognizer;
+let streamApiClient;
 let inboundStreamMediaFormat = {};
 let lastTranscribeBroadcast;
 
@@ -81,7 +80,9 @@ app.put('/send', async (req, res) => {
   }
 
   console.debug(`Active connection count: ${connections.size}`);
-  await broadcastMessage(req, req.body.payload.msg);
+  const apiClient = makeApiClient(req);
+  const myConnectionId = req.body.connectionId;
+  await broadcast(apiClient, myConnectionId, req.body.payload.msg);
   res.sendStatus(200);
 });
 
@@ -99,7 +100,7 @@ app.put('/default', async (req, res) => {
 
   const payload = req.body.payload;
   if (payload.event == 'connected' && payload.protocol == 'Call') {
-    streamConnected();
+    streamConnected(req);
   } else if (payload.event == 'start') {
     await streamStart(req);
   } else if (payload.event == 'media') {
@@ -144,10 +145,7 @@ async function killWebSocketConnection(req) {
   }
 }
 
-async function broadcastMessage(req, msg) {
-  const apiClient = makeApiClient(req);
-  const myConnectionId = req.body.connectionId;
-
+async function broadcast(apiClient, myConnectionId, msg) {
   for (const connectionId of connections) {
     if (connectionId != myConnectionId) {
       const command = new PostToConnectionCommand({
@@ -165,10 +163,11 @@ async function broadcastMessage(req, msg) {
 
 // Audio stream helpers
 
-function streamConnected() {
+function streamConnected(req) {
   console.debug('Call connected, initializing Vosk model...');
   voskModel = new VoskModel(modelPath);
   voskRecognizer = new Recognizer({ model: voskModel, sampleRate: voskSampleRate })
+  streamApiClient = makeApiClient(req);
 }
 
 async function streamStart(req) {
@@ -180,64 +179,20 @@ async function streamStart(req) {
   }
 }
 
-const bufferSizeFlush = 10;
-let audioBuffer = [];
-let audioBufferSeqOffset;
-let outOfOrderAudioChunks = new Map();
-
 async function streamMedia(req) {
-  const payload = req.body.payload;
-
-  const seqNum = payload.sequenceNumber;
-  const audioData = payload.media.payload;
-
-  if (audioBuffer.length == 0) {
-    audioBuffer.push(audioData);
-    audioBufferSeqOffset = seqNum;
-    return;
-  }
-
-  const nextSeqNum = audioBuffer.length + audioBufferSeqOffset;
-  if (nextSeqNum == seqNum) {
-    audioBuffer.push(audioData);
-    fillOutOfOrderChunks();
-    await maybeFlushAudioBuffer();
+  const audioData = req.body.payload.media.payload;
+  const samples = getSamples(audioData);
+  let result;
+  if (voskRecognizer.acceptWaveform(samples)) {
+    result = voskRecognizer.result().text;
   } else {
-    outOfOrderAudioChunks.set(seqNum, audioData);
-  }
-}
-
-function fillOutOfOrderChunks() {
-  let isDone = false;
-  while (!isDone) {
-    const nextSeqNum = audioBuffer.length + audioBufferSeqOffset;
-    const nextValue = outOfOrderAudioChunks.get(nextSeqNum);
-    if (nextValue) {
-      audioBuffer.push(nextValue);
-      outOfOrderAudioChunks.delete(nextSeqNum);
-    } else {
-      isDone = true;
-    }
-  }
-}
-
-async function maybeFlushAudioBuffer() {
-  if (audioBuffer.length < bufferSizeFlush) {
-    return false;
+    result = voskRecognizer.partialResult().partial;
   }
 
-  const decodedAudioData = audioBuffer.map((encoded) => Buffer.from(encoded, 'base64'));
-  const joinedAudioData = Buffer.concat(decodedAudioData);
-  audioBufferSeqOffset += audioBuffer.length;
-  audioBuffer = [];
-
-  const result = getTranscription(joinedAudioData);
-  if (result && result != lastTranscribeBroadcast) {
+  if (result != lastTranscribeBroadcast) {
     lastTranscribeBroadcast = result;
-    await broadcastMessage(req, result);
+    await broadcast(streamApiClient, req.body.connectionId, result);
   }
-
-  return true;
 }
 
 function streamStop(req) {
@@ -265,28 +220,18 @@ function parseInboundStreamMediaFormat(payload) {
   };
 }
 
-function getSamples(audioData) {
+function getSamples(mediaPayload) {
+  const buf = Buffer.from(mediaPayload, 'base64');
   const wav = new WaveFile();
   wav.fromScratch(
     inboundStreamMediaFormat.channels,
     inboundStreamMediaFormat.sampleRate,
     inboundStreamMediaFormat.bitDepth,
-    audioData
+    buf
   );
   wav.fromMuLaw();
   wav.toSampleRate(voskSampleRate);
   return wav.data.samples;
-}
-
-function getTranscription(audioData) {
-  const samples = getSamples(audioData);
-  if (voskRecognizer.acceptWaveform(samples)) {
-    const result = voskRecognizer.result();
-    return result.text;
-  } else {
-    const result = voskRecognizer.partialResult();
-    return result.partial;
-  }
 }
 
 server.listen(port, () => {
