@@ -45,10 +45,10 @@ if (!filePathExists(modelPath)) {
 
 // Audio stream
 const voskSampleRate = 16000;
-var voskModel;
-var voskRecognizer;
-var inboundStreamMediaFormat = {};
-var lastTranscribeBroadcast;
+let voskModel;
+let voskRecognizer;
+let inboundStreamMediaFormat = {};
+let lastTranscribeBroadcast;
 
 // Routes
 
@@ -180,13 +180,88 @@ async function streamStart(req) {
   }
 }
 
+const bufferSizeFlush = 10;
+let audioBuffer = [];
+let audioBufferSeqOffset;
+let outOfOrderAudioChunks = new Map();
+
+let debugAudioBuffer = [];
+let debugOutOfOrderAudioChunks = new Set();
+
 async function streamMedia(req) {
   const payload = req.body.payload;
-  const result = getTranscription(payload.media.payload);
-  if (result && result != lastTranscribeBroadcast) {
-    lastTranscribeBroadcast = result;
-    await broadcastMessage(req, result);
+
+  const seqNum = payload.sequenceNumber;
+  const audioData = payload.media.payload;
+
+  if (audioBuffer.length == 0) {
+    audioBuffer.push(audioData);
+    audioBufferSeqOffset = seqNum;
+
+    //
+    debugAudioBuffer.push(seqNum);
+
+    return;
   }
+
+  const nextSeqNum = audioBuffer.length + audioBufferSeqOffset;
+  if (nextSeqNum == seqNum) {
+    audioBuffer.push(audioData);
+
+    //
+    debugAudioBuffer.push(seqNum);
+
+    fillOutOfOrderChunks();
+    await maybeFlushAudioBuffer();
+  } else {
+    outOfOrderAudioChunks.set(seqNum, audioData);
+    
+    //
+    debugOutOfOrderAudioChunks.add(seqNum);
+  }
+}
+
+function fillOutOfOrderChunks() {
+  let isDone = false;
+  while (!isDone) {
+    const nextSeqNum = audioBuffer.length + audioBufferSeqOffset;
+    const nextValue = outOfOrderAudioChunks.get(nextSeqNum);
+    if (nextValue) {
+      audioBuffer.push(nextValue);
+      outOfOrderAudioChunks.delete(nextSeqNum);
+
+      //
+      debugAudioBuffer.push(nextSeqNum);
+      debugOutOfOrderAudioChunks.delete(nextSeqNum);
+    } else {
+      isDone = true;
+    }
+  }
+}
+
+async function maybeFlushAudioBuffer() {
+  if (audioBuffer.length < bufferSizeFlush) {
+    return false;
+  }
+
+  const audioData = audioBuffer.reduce(
+    (state, value) => state + value,
+    ""
+  );
+  audioBufferSeqOffset += audioBuffer.length;
+  audioBuffer = [];
+
+  //
+  console.debug(`Flushing: ${debugAudioBuffer}`);
+  debugAudioBuffer = [];
+
+  // const result = getTranscription(audioData);
+  // if (result && result != lastTranscribeBroadcast) {
+  //   lastTranscribeBroadcast = result;
+  //   await broadcastMessage(req, result);
+  // }
+
+  return true;
 }
 
 function streamStop(req) {
@@ -239,6 +314,32 @@ function getTranscription(mediaPayload) {
   }
 }
 
-server.listen(port, () => {
-  console.log("Listening on port", port);
-});
+// server.listen(port, () => {
+//   console.log("Listening on port", port);
+// });
+
+function printDebugState(seqNum) {
+  console.debug(`Iteration: ${seqNum}`);
+  console.debug(debugAudioBuffer);
+  console.debug(debugOutOfOrderAudioChunks);
+  console.log();
+}
+
+function makeMockReq(seqNum) {
+  return ;
+}
+
+const testData = [3, 4, 6, 5, 7, 8, 10, 11, 12, 9, 13, 16, 15, 17, 14];
+for (const seqNum of testData) {
+  streamMedia({
+    body: {
+      payload: {
+        sequenceNumber: seqNum,
+        media: {
+          payload: "a"
+        }
+      }
+    }
+  });
+  printDebugState(seqNum);
+}
