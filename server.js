@@ -133,11 +133,9 @@ function makeApiClient(req) {
 }
 
 async function killWebSocketConnection(req) {
-  const apiClient = makeApiClient(req);
+  const apiClient = streamApiClient || makeApiClient(req);
   const connectionId = req.body.connectionId;
-  const command = new DeleteConnectionCommand({
-    ConnectionId: connectionId
-  });
+  const command = new DeleteConnectionCommand({ ConnectionId: connectionId });
   try {
     await apiClient.send(command);
   } catch (error) {
@@ -148,10 +146,7 @@ async function killWebSocketConnection(req) {
 async function broadcast(apiClient, myConnectionId, msg) {
   for (const connectionId of connections) {
     if (connectionId != myConnectionId) {
-      const command = new PostToConnectionCommand({
-        ConnectionId: connectionId,
-        Data: msg
-      });
+      const command = new PostToConnectionCommand({ ConnectionId: connectionId, Data: msg });
       try {
         await apiClient.send(command);
       } catch (error) {
@@ -166,7 +161,7 @@ async function broadcast(apiClient, myConnectionId, msg) {
 function streamConnected(req) {
   console.debug('Call connected, initializing Vosk model...');
   voskModel = new VoskModel(modelPath);
-  voskRecognizer = new Recognizer({ model: voskModel, sampleRate: voskSampleRate })
+  voskRecognizer = new Recognizer({ model: voskModel, sampleRate: voskSampleRate });
   streamApiClient = makeApiClient(req);
 }
 
@@ -180,6 +175,10 @@ async function streamStart(req) {
 }
 
 async function streamMedia(req) {
+  if (!voskRecognizer) {
+    return;
+  }
+
   const audioData = req.body.payload.media.payload;
   const samples = getSamples(audioData);
   let result;
@@ -200,6 +199,7 @@ function streamStop(req) {
   console.debug(`Stopping stream with ID: ${payload.streamSid}`);
   voskRecognizer = null;
   voskModel = null;
+  streamApiClient = null;
 }
 
 function parseInboundStreamMediaFormat(payload) {
