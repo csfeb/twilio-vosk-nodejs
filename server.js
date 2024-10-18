@@ -47,6 +47,9 @@ let voskModel;
 let voskRecognizer;
 let streamApiClient;
 let inboundStreamMediaFormat = {};
+
+let lastSeqNum;
+let outOfOrderChunks = new Map();
 let lastTranscribeBroadcast;
 
 // Routes
@@ -163,6 +166,10 @@ function streamConnected(req) {
   voskModel = new VoskModel(modelPath);
   voskRecognizer = new Recognizer({ model: voskModel, sampleRate: voskSampleRate });
   streamApiClient = makeApiClient(req);
+
+  lastSeqNum = undefined;
+  outOfOrderChunks = new Map();
+  lastTranscribeBroadcast = undefined;
 }
 
 async function streamStart(req) {
@@ -173,9 +180,6 @@ async function streamStart(req) {
     await killWebSocketConnection(req);
   }
 }
-
-let lastSeqNum;
-let outOfOrderChunks = new Map();
 
 async function streamMedia(req) {
   if (!voskRecognizer) {
@@ -188,14 +192,18 @@ async function streamMedia(req) {
     return;
   }
   const audioData = req.body.payload.media.payload;
-  // console.debug(`Got seqNum: ${seqNum}, last one is: ${lastSeqNum}, queued: ${outOfOrderChunks.size}`);
+  
+  if (seqNum % 1000 == 0) {
+    console.debug(`Got seqNum: ${seqNum}, last one is: ${lastSeqNum}, queued: ${outOfOrderChunks.size}`);
+  }
 
   if (isNextChunk(seqNum)) {
     const results = processMedia(seqNum, audioData);
-    const text = results.join('\n');
-    if (text != lastTranscribeBroadcast) {
-      lastTranscribeBroadcast = text;
-      await broadcast(streamApiClient, req.body.connectionId, text);
+    for (const text of results) {
+      if (text != lastTranscribeBroadcast) {
+        lastTranscribeBroadcast = text;
+        await broadcast(streamApiClient, req.body.connectionId, text);
+      }
     }
   } else {
     outOfOrderChunks.set(seqNum, audioData);
@@ -209,7 +217,6 @@ function isNextChunk(seqNum) {
   }
 
   const expectedSeqNum = lastSeqNum + 1;
-  // console.debug(`isNextChunk ${seqNum} == ${expectedSeqNum}`);
   if (seqNum == expectedSeqNum) {
     return true;
   }
@@ -225,7 +232,6 @@ function processMedia(seqNum, audioData) {
   let workingAudioData = audioData;
 
   while (!isDone) {
-    // console.debug(`Processing seqNum: ${workingSeqNum}`);
     const result = transcribeChunk(workingAudioData);
     if (result && result.length > 0) {
       results.push(result);
@@ -240,8 +246,6 @@ function processMedia(seqNum, audioData) {
       isDone = true;
     }
   }
-
-  // console.debug(`Process done starting at ${seqNum} and ending at ${lastSeqNum} with ${results.length} results`);
 
   return results;
 }
@@ -261,6 +265,10 @@ function streamStop(req) {
   voskRecognizer = null;
   voskModel = null;
   streamApiClient = null;
+
+  lastSeqNum = undefined;
+  outOfOrderChunks = new Map();
+  lastTranscribeBroadcast = undefined;
 }
 
 function parseInboundStreamMediaFormat(payload) {
