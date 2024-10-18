@@ -174,23 +174,84 @@ async function streamStart(req) {
   }
 }
 
+let lastSeqNum;
+let outOfOrderChunks = new Map();
+
 async function streamMedia(req) {
   if (!voskRecognizer) {
     return;
   }
 
+  const seqNum = parseInt(req.body.payload.sequenceNumber);
+  if (isNaN(seqNum)) {
+    console.error('Media sequence number is NaN');
+    return;
+  }
   const audioData = req.body.payload.media.payload;
-  const samples = getSamples(audioData);
-  let result;
-  if (voskRecognizer.acceptWaveform(samples)) {
-    result = voskRecognizer.result().text;
+  // console.debug(`Got seqNum: ${seqNum}, last one is: ${lastSeqNum}, queued: ${outOfOrderChunks.size}`);
+
+  if (isNextChunk(seqNum)) {
+    const results = processMedia(seqNum, audioData);
+    const text = results.join('\n');
+    if (text != lastTranscribeBroadcast) {
+      lastTranscribeBroadcast = text;
+      await broadcast(streamApiClient, req.body.connectionId, text);
+    }
   } else {
-    result = voskRecognizer.partialResult().partial;
+    outOfOrderChunks.set(seqNum, audioData);
+  }
+}
+
+function isNextChunk(seqNum) {
+  if (!lastSeqNum) {
+    // First chunk
+    return true;
   }
 
-  if (result != lastTranscribeBroadcast) {
-    lastTranscribeBroadcast = result;
-    await broadcast(streamApiClient, req.body.connectionId, result);
+  const expectedSeqNum = lastSeqNum + 1;
+  // console.debug(`isNextChunk ${seqNum} == ${expectedSeqNum}`);
+  if (seqNum == expectedSeqNum) {
+    return true;
+  }
+
+  return false;
+}
+
+function processMedia(seqNum, audioData) {
+  let isDone = false
+  let results = [];
+
+  let workingSeqNum = seqNum;
+  let workingAudioData = audioData;
+
+  while (!isDone) {
+    // console.debug(`Processing seqNum: ${workingSeqNum}`);
+    const result = transcribeChunk(workingAudioData);
+    if (result && result.length > 0) {
+      results.push(result);
+    }
+
+    workingAudioData = outOfOrderChunks.get(workingSeqNum + 1);
+    if (workingAudioData) {
+      workingSeqNum += 1;
+      outOfOrderChunks.delete(workingSeqNum);
+    } else {
+      lastSeqNum = workingSeqNum;
+      isDone = true;
+    }
+  }
+
+  // console.debug(`Process done starting at ${seqNum} and ending at ${lastSeqNum} with ${results.length} results`);
+
+  return results;
+}
+
+function transcribeChunk(audioData) {
+  const samples = getSamples(audioData);
+  if (voskRecognizer.acceptWaveform(samples)) {
+    return voskRecognizer.result().text;
+  } else {
+    return voskRecognizer.partialResult().partial;
   }
 }
 
