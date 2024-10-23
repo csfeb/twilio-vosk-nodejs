@@ -62,6 +62,7 @@ let inboundStreamMediaFormat = {};
 
 let lastSeqNum;
 let outOfOrderChunks = new Map();
+const outOfOrderTreshold = 25;
 let lastTranscribeBroadcast;
 
 // Routes
@@ -237,7 +238,26 @@ async function streamMedia(req) {
       }
     }
   } else {
-    outOfOrderChunks.set(seqNum, audioData);
+    if (seqNum > lastSeqNum) {
+      // Only care about future chunks that will be processed, not late ones coming in after we already moved past
+      outOfOrderChunks.set(seqNum, audioData);
+    }
+  }
+
+  if (outOfOrderChunks.size >= outOfOrderTreshold) {
+    // Out of order queue is getting filled up, sequential chunk might have been lost
+    // Find the earliest queued chunk and process from there
+    const minSeqNum = Math.min(...outOfOrderChunks.keys());
+    console.debug(`Out of order treshold hit, last processed: ${lastSeqNum}, min queued: ${minSeqNum}, queued: ${outOfOrderChunks.size}`);
+    const minAudioData = outOfOrderChunks.get(minSeqNum);
+    
+    const results = processMedia(seqNum, audioData);
+    for (const text of results) {
+      if (text != lastTranscribeBroadcast) {
+        lastTranscribeBroadcast = text;
+        await broadcast(streamApiClient, subLiveTrans, text);
+      }
+    }
   }
 }
 
