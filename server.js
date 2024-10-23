@@ -34,7 +34,19 @@ app.get('/health', (req, res) => {
 });
 
 const server = http.createServer(app);
+
+// Contains all active socket connections to the server
 const connections = new Set();
+// Contains all active socket connections subscribed to live transcription
+const subLiveTrans = new Set();
+// Contains all active socket connections subscribed scam detection
+const subScamDetect = new Set();
+
+function purgeConnection(connectionId) {
+  connections.delete(connectionId);
+  subLiveTrans.delete(connectionId);
+  subScamDetect.delete(connectionId);
+}
 
 const modelPath = 'model';
 if (!filePathExists(modelPath)) {
@@ -67,7 +79,7 @@ app.post('/connect', (req, res) => {
 app.post('/disconnect', (req, res) => {
   const connectionId = req.body.connectionId;
   if (connectionId) {
-    connections.delete(connectionId);
+    purgeConnection(connectionId);
     console.debug(`Client ${connectionId} disconnected`);
   } else {
     console.error('Client without a connectionId disconnected');
@@ -84,9 +96,30 @@ app.put('/send', async (req, res) => {
 
   console.debug(`Active connection count: ${connections.size}`);
   const apiClient = makeApiClient(req);
-  const myConnectionId = req.body.connectionId;
-  await broadcast(apiClient, myConnectionId, req.body.payload.msg);
+  await broadcast(apiClient, connections, req.body.payload.msg);
   res.sendStatus(200);
+});
+
+app.put('/sub', (req, res) => {
+  const connectionId = req.body.connectionId;
+  if (!connectionId) {
+    return res.status(400).send('connectionId missing');
+  }
+
+  if (!req.body.payload || !req.body.payload.channel) {
+    return res.status(400).send('channel missing');
+  }
+  
+  switch (req.body.payload.channel) {
+  case 'live':
+    subLiveTrans.add(connectionId);
+    return res.status(200).send('subscribed to live voice transcription');
+  case 'scam':
+    subScamDetect.add(connectionId);
+    return res.status(200).send('subscribed to scam detection');
+  default:
+    return res.status(400).send('unexpected channel type, supported values are "live" and "scam"');
+  }
 });
 
 app.put('/default', async (req, res) => {
@@ -146,15 +179,13 @@ async function killWebSocketConnection(req) {
   }
 }
 
-async function broadcast(apiClient, myConnectionId, msg) {
+async function broadcast(apiClient, connections, msg) {
   for (const connectionId of connections) {
-    if (connectionId != myConnectionId) {
-      const command = new PostToConnectionCommand({ ConnectionId: connectionId, Data: msg });
-      try {
-        await apiClient.send(command);
-      } catch (error) {
-        console.error(`Failed to broadcast message with error: ${error}`);
-      }
+    const command = new PostToConnectionCommand({ ConnectionId: connectionId, Data: msg });
+    try {
+      await apiClient.send(command);
+    } catch (error) {
+      console.error(`Failed to broadcast message with error: ${error}`);
     }
   }
 }
@@ -202,7 +233,7 @@ async function streamMedia(req) {
     for (const text of results) {
       if (text != lastTranscribeBroadcast) {
         lastTranscribeBroadcast = text;
-        await broadcast(streamApiClient, req.body.connectionId, text);
+        await broadcast(streamApiClient, subLiveTrans, text);
       }
     }
   } else {
