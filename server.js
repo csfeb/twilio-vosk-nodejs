@@ -60,10 +60,22 @@ let voskRecognizer;
 let streamApiClient;
 let inboundStreamMediaFormat = {};
 
+// Last processed media payload sequence number
 let lastSeqNum;
+// Queue of unprocessed audio chunks keyed by sequence number
 let outOfOrderChunks = new Map();
-const outOfOrderTreshold = 25;
+// Threshold for lost packets recovery, if out of order queue reaches size reaches this value it will force
+// processing starting from the min sequence number contained in the queue
+const outOfOrderThreshold = 25;
+// Last text that was broadcast to `live` channel subscribers
 let lastTranscribeBroadcast;
+
+// Counter of received media payloads
+let mediaCounter = 0;
+// Full text of transcription so far minus the currently in progress recognition
+let transcription;
+// Text of transcription for current in progress recognition
+let inProgressTranscription;
 
 // Routes
 
@@ -202,6 +214,10 @@ function streamConnected(req) {
   lastSeqNum = undefined;
   outOfOrderChunks = new Map();
   lastTranscribeBroadcast = undefined;
+
+  mediaCounter = 0;
+  transcription = '';
+  inProgressTranscription = '';
 }
 
 async function streamStart(req) {
@@ -225,7 +241,8 @@ async function streamMedia(req) {
   }
   const audioData = req.body.payload.media.payload;
   
-  if (seqNum % 1000 == 0) {
+  mediaCounter += 1;
+  if (mediaCounter % 1000 == 0) {
     console.debug(`Got seqNum: ${seqNum}, last one is: ${lastSeqNum}, queued: ${outOfOrderChunks.size}`);
   }
 
@@ -244,12 +261,28 @@ async function streamMedia(req) {
     }
   }
 
-  if (outOfOrderChunks.size >= outOfOrderTreshold) {
+  if (outOfOrderChunks.size >= outOfOrderThreshold) {
     // Out of order queue is getting filled up, sequential chunk might have been lost
-    // Find the earliest queued chunk and process from there
-    const minSeqNum = Math.min(...outOfOrderChunks.keys());
-    console.debug(`Out of order treshold hit, last processed: ${lastSeqNum}, min queued: ${minSeqNum}, queued: ${outOfOrderChunks.size}`);
+    // Find the earliest queued chunk that's after the last processed one and resume from there
+    let minSeqNum = Number.MAX_SAFE_INTEGER;
+    const keys = outOfOrderChunks.keys();
+    for (const key of keys) {
+      if (key < lastSeqNum) {
+        // This chunk has been skipped over, drop it
+        outOfOrderChunks.delete(key);
+      } else if (key < minSeqNum) {
+        minSeqNum = key;
+      }
+    }
+
+    if (minSeqNum == Number.MAX_SAFE_INTEGER) {
+      console.debug('Dropped all out of order chunks');
+      return;
+    }
+
+    console.debug(`Out of order threshold hit, last processed: ${lastSeqNum}, min queued: ${minSeqNum}, queued: ${outOfOrderChunks.size}`);
     const minAudioData = outOfOrderChunks.get(minSeqNum);
+    outOfOrderChunks.delete(minSeqNum);
     
     const results = processMedia(seqNum, audioData);
     for (const text of results) {
@@ -258,6 +291,11 @@ async function streamMedia(req) {
         await broadcast(streamApiClient, subLiveTrans, text);
       }
     }
+  }
+
+  if (mediaCounter % 100 == 0) {
+    const textSoFar = transcription + inProgressTranscription;
+    await broadcast(streamApiClient, subScamDetect, textSoFar);
   }
 }
 
@@ -284,8 +322,15 @@ function processMedia(seqNum, audioData) {
 
   while (!isDone) {
     const result = transcribeChunk(workingAudioData);
-    if (result && result.length > 0) {
-      results.push(result);
+    if (result.text && result.text.length > 0) {
+      results.push(result.text);
+
+      if (result.isPartial) {
+        inProgressTranscription = result.text;
+      } else {
+        transcription += `${result.text}\n`;
+        inProgressTranscription = '';
+      }
     }
 
     workingAudioData = outOfOrderChunks.get(workingSeqNum + 1);
@@ -304,9 +349,15 @@ function processMedia(seqNum, audioData) {
 function transcribeChunk(audioData) {
   const samples = getSamples(audioData);
   if (voskRecognizer.acceptWaveform(samples)) {
-    return voskRecognizer.result().text;
+    return {
+      text: voskRecognizer.result().text,
+      isPartial: false
+    };
   } else {
-    return voskRecognizer.partialResult().partial;
+    return {
+      text: voskRecognizer.partialResult().partial,
+      isPartial: true
+    };
   }
 }
 
@@ -320,6 +371,9 @@ function streamStop(req) {
   lastSeqNum = undefined;
   outOfOrderChunks = new Map();
   lastTranscribeBroadcast = undefined;
+
+  transcription = undefined;
+  inProgressTranscription = undefined;
 }
 
 function parseInboundStreamMediaFormat(payload) {
